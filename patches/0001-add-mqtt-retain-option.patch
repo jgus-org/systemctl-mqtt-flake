@@ -1,0 +1,151 @@
+From 2af244527a895dbb03b5d4380bbd7a7f77eef886 Mon Sep 17 00:00:00 2001
+From: Josh Gustafson <j@gustafson.me>
+Date: Mon, 26 Oct 2026 14:43:14 -0600
+Subject: [PATCH] add --mqtt-retain to publish state and discovery topics
+ retained
+
+The availability topic and the last will are published retained, but
+`preparing-for-shutdown`, each unit's `active-state`, and the Home
+Assistant device discovery config are not, so a client subscribing after
+the last publish sees nothing until the next state change. Retaining them
+makes the current state available immediately; inbound retained messages
+are already ignored, so retaining does not replay actions.
+
+Without the flag the published messages are exactly as upstream has them.
+---
+ systemctl_mqtt/__init__.py | 25 +++++++++++++++++++++----
+ tests/test_cli.py          |  2 ++
+ tests/test_dbus.py         |  4 +++-
+ 3 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/systemctl_mqtt/__init__.py b/systemctl_mqtt/__init__.py
+index af9daeb..e598eac 100644
+--- a/systemctl_mqtt/__init__.py
++++ b/systemctl_mqtt/__init__.py
+@@ -68,8 +68,10 @@ class _State:
+         poweroff_delay: datetime.timedelta,
+         monitored_system_unit_names: list[str],
+         controlled_system_unit_names: list[str],
++        mqtt_retain: bool = False,
+     ) -> None:
+         self._mqtt_topic_prefix = mqtt_topic_prefix
++        self.mqtt_retain = mqtt_retain
+         self._homeassistant_discovery_prefix = homeassistant_discovery_prefix
+         self._homeassistant_discovery_object_id = homeassistant_discovery_object_id
+         self._login_manager = (
+@@ -146,7 +148,7 @@ class _State:
+         # pylint: disable=protected-access
+         payload = systemctl_mqtt._mqtt.encode_bool(active)
+         _LOGGER.info("publishing %r on %s", payload, topic)
+-        await mqtt_client.publish(topic=topic, payload=payload, retain=False)
++        await mqtt_client.publish(topic=topic, payload=payload, retain=self.mqtt_retain)
+ 
+     async def preparing_for_shutdown_handler(
+         self, active: bool, mqtt_client: aiomqtt.Client
+@@ -259,7 +261,9 @@ class _State:
+ 
+         _LOGGER.debug("publishing home assistant config on %s", discovery_topic)
+         await mqtt_client.publish(
+-            topic=discovery_topic, payload=json.dumps(config), retain=False
++            topic=discovery_topic,
++            payload=json.dumps(config),
++            retain=self.mqtt_retain,
+         )
+ 
+ 
+@@ -457,7 +461,9 @@ async def _dbus_signal_loop_unit(  # pylint: disable=too-many-arguments
+         unit_name=unit_name
+     )
+     ((_, last_active_state),) = await unit_proxy.Get(property_name="ActiveState")
+-    await mqtt_client.publish(topic=active_state_topic, payload=last_active_state)
++    await mqtt_client.publish(
++        topic=active_state_topic, payload=last_active_state, retain=state.mqtt_retain
++    )
+     with dbus_router.filter(unit_properties_changed_match_rule) as queue:
+         while True:
+             await queue.get()
+@@ -466,7 +472,9 @@ async def _dbus_signal_loop_unit(  # pylint: disable=too-many-arguments
+             )
+             if current_active_state != last_active_state:
+                 await mqtt_client.publish(
+-                    topic=active_state_topic, payload=current_active_state
++                    topic=active_state_topic,
++                    payload=current_active_state,
++                    retain=state.mqtt_retain,
+                 )
+                 last_active_state = current_active_state
+             queue.task_done()
+@@ -522,6 +530,7 @@ async def _run(  # pylint: disable=too-many-arguments
+     monitored_system_unit_names: list[str],
+     controlled_system_unit_names: list[str],
+     mqtt_disable_tls: bool = False,
++    mqtt_retain: bool = False,
+ ) -> None:
+     state = _State(
+         mqtt_topic_prefix=mqtt_topic_prefix,
+@@ -530,6 +539,7 @@ async def _run(  # pylint: disable=too-many-arguments
+         poweroff_delay=poweroff_delay,
+         monitored_system_unit_names=monitored_system_unit_names,
+         controlled_system_unit_names=controlled_system_unit_names,
++        mqtt_retain=mqtt_retain,
+     )
+     _LOGGER.info(
+         "connecting to MQTT broker %s:%d (TLS %s)",
+@@ -619,6 +629,12 @@ def _main() -> None:
+         default="systemctl/" + systemctl_mqtt._utils.get_hostname(),
+         help="default: %(default)s",
+     )
++    argparser.add_argument(
++        "--mqtt-retain",
++        action="store_true",
++        help="publish state and Home Assistant discovery messages with MQTT's"
++        " retain flag (availability and the last will are always retained)",
++    )
+     # https://www.home-assistant.io/docs/mqtt/discovery/#discovery_prefix
+     argparser.add_argument(
+         "--homeassistant-discovery-prefix",
+@@ -694,5 +710,6 @@ def _main() -> None:
+             poweroff_delay=datetime.timedelta(seconds=args.poweroff_delay_seconds),
+             monitored_system_unit_names=args.monitored_system_unit_names or [],
+             controlled_system_unit_names=args.controlled_system_unit_names or [],
++            mqtt_retain=args.mqtt_retain,
+         )
+     )
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 14379b8..3326645 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -183,6 +183,7 @@ def test__main(
+         poweroff_delay=datetime.timedelta(seconds=4),
+         monitored_system_unit_names=[],
+         controlled_system_unit_names=[],
++        mqtt_retain=False,
+     )
+ 
+ 
+@@ -232,6 +233,7 @@ def test__main_password_file(tmpdir, password_file_content, expected_password):
+         poweroff_delay=datetime.timedelta(seconds=4),
+         monitored_system_unit_names=[],
+         controlled_system_unit_names=[],
++        mqtt_retain=False,
+     )
+ 
+ 
+diff --git a/tests/test_dbus.py b/tests/test_dbus.py
+index f272df4..6776dfa 100644
+--- a/tests/test_dbus.py
++++ b/tests/test_dbus.py
+@@ -437,7 +437,9 @@ async def test__dbus_signal_loop_unit() -> None:
+     assert not add_match_kwargs
+     assert mqtt_client_mock.publish.await_args_list == [
+         unittest.mock.call(
+-            topic="prefix/unit/system/foo.service/active-state", payload=s
++            topic="prefix/unit/system/foo.service/active-state",
++            payload=s,
++            retain=False,
+         )
+         for s in [  # consecutive duplicates filtered
+             "active",
+-- 
+2.54.0
+

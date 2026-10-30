@@ -15,7 +15,7 @@
     let
       pin = import ./pin.nix;
     in
-    flake-lib.lib.mkLeafFlake {
+    flake-lib.lib.mkPythonFlake {
       inherit
         nixpkgs
         pin
